@@ -1,0 +1,51 @@
+[package]
+name = "hrest-core"
+version = "0.1.0"
+edition = "2021"
+description = "HRest Protocol — High-Performance Binary Serialization Core Engine"
+license = "MIT"
+repository = "https://github.com/libcreator/hyperrest"
+keywords = ["binary", "serialization", "rest", "protocol", "http2"]
+categories = ["encoding", "network-programming", "web-programming"]
+
+[lib]
+name = "hrest_core"
+# cdylib  → C shared library (FFI: .so / .dll / .dylib)
+# rlib    → Rust library (used as a Rust dependency)
+crate-type = ["cdylib", "rlib"]
+
+# ---------------------------------------------------------------------------
+# Feature Flags
+# ---------------------------------------------------------------------------
+[features]
+default = []
+
+# Enable C-compatible FFI exports (#[no_mangle] extern "C")
+ffi = []
+
+# Enable WebAssembly exports (#[wasm_bindgen])
+wasm = ["dep:wasm-bindgen"]
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+[dependencies]
+# JSON parsing — only in infrastructure layer
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Contract hash integrity (SHA-256)
+sha2 = "0.10"
+hex  = "0.4"
+
+# Ergonomic error types — domain layer only
+thiserror = "2"
+
+# WASM bindings — optional
+wasm-bindgen = { version = "0.2", optional = true }
+
+# ---------------------------------------------------------------------------
+# Dev Dependencies
+# ---------------------------------------------------------------------------
+[dev-dependencies]
+# No extra dev deps needed; use cargo's built-in test harness
