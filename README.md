@@ -240,7 +240,7 @@ const binary = encode(
 const response = await fetch('/api/v1/test/run', {
   method: 'POST',
   headers: {
-    'Content-Type': 'application/vnd.hrest.binary',
+    'Content-Type': 'application/hrest',
     'X-Hrest-Hash': contractHash,
   },
   body: binary,
@@ -259,7 +259,7 @@ HRest uses the following HTTP headers alongside binary payloads:
 
 | Header | Direction | Description |
 |---|---|---|
-| `Content-Type: application/vnd.hrest.binary` | Request + Response | Signals binary HRest payload |
+| `Content-Type: application/hrest` | Request + Response | Signals binary HRest payload |
 | `X-Hrest-Hash: <sha256>` | Request | Client contract version validation |
 | `X-Hrest-Version: 1.0.0` | Request | Protocol version check |
 | `X-Hrest-Error: <CODE>` | Response | Machine-readable error code |
