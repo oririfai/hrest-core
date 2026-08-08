@@ -4,7 +4,6 @@
 
 [![Crates.io](https://img.shields.io/crates/v/hrest-core)](https://crates.io/crates/hrest-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Build](https://img.shields.io/github/actions/workflow/status/libcreator/hyperrest/ci.yml)](https://github.com/libcreator/hyperrest/actions)
 
 HRest is a high-performance data communication protocol that bridges the developer-friendliness of REST APIs (JSON on the developer side) with the transmission efficiency of binary protocols like gRPC — using **Key-Tokenization** and **Binary TLV Packing** over HTTP/2.
 
@@ -120,8 +119,8 @@ fn main() {
 
 **Output:**
 ```
-JSON  : 48 bytes
-Binary: 11 bytes (77% smaller)
+JSON  : 51 bytes
+Binary: 15 bytes (~71% smaller)
 Restored: {"event":"start","headless":true,"task_id":42}
 ```
 
@@ -370,4 +369,4 @@ cargo clippy      # no warnings allowed
 
 ## License
 
-[MIT](../LICENSE) © 2026 libcreator
+[MIT](../LICENSE) © 2026 HyperRest Project
