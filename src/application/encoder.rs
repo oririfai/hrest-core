@@ -207,3 +207,52 @@ fn encode_nested_object(
 
     encode_object_fields(out, obj, field_map)
 }
+
+#[cfg(test)]
+mod compliance_test {
+    use super::*;
+    use serde_json::json;
+    use crate::domain::contract::{ContractData, FieldMap};
+
+    struct MockProvider(ContractData);
+    impl ContractProvider for MockProvider {
+        fn contract(&self) -> &ContractData {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn print_compliance_hex() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("event".to_string(), 1);
+        fields.insert("success".to_string(), 2);
+        fields.insert("count".to_string(), 3);
+        fields.insert("score".to_string(), 4);
+        fields.insert("tags".to_string(), 5);
+        fields.insert("meta".to_string(), 6);
+        fields.insert("ip".to_string(), 7);
+        fields.insert("retries".to_string(), 8);
+
+        let field_map = FieldMap::new(fields);
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("POST /compliance".to_string(), field_map);
+
+        let contract = ContractData::new("1.0.0".to_string(), "hash".to_string(), routes);
+        let provider = MockProvider(contract);
+
+        let payload = json!({
+            "event": "login",
+            "success": true,
+            "count": 150,
+            "score": -42.5,
+            "tags": ["web", "mobile"],
+            "meta": {
+                "ip": "127.0.0.1",
+                "retries": 3
+            }
+        });
+
+        let bytes = encode_payload("POST /compliance", &payload, &provider).unwrap();
+        println!("RUST_HEX={}", hex::encode(&bytes));
+    }
+}
