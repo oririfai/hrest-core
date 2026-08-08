@@ -359,8 +359,8 @@ hyperrest/
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
 ```bash
-git clone https://github.com/libcreator/hyperrest
-cd hyperrest/hrest-core
+git clone https://github.com/oririfai/hrest-core
+cd hrest-core
 cargo test        # all tests must pass
 cargo clippy      # no warnings allowed
 ```
