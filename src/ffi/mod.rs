@@ -15,13 +15,146 @@
 // ============================================================================
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 
 use crate::infrastructure::contract_loader::JsonContractLoader;
 use crate::{decode, encode};
 
 // ---------------------------------------------------------------------------
-// Encode
+// Stateful Loader (Maximum Performance)
+// ---------------------------------------------------------------------------
+
+/// Create a new stateful HrestLoader instance.
+/// 
+/// # Parameters
+/// - `contract_json` — null-terminated C string containing `hrest-contract.json`
+/// 
+/// # Returns
+/// Pointer to a heap-allocated `JsonContractLoader` on success, or `NULL` on error.
+/// Must be freed with [`hrest_loader_free`].
+#[no_mangle]
+pub unsafe extern "C" fn hrest_loader_new(contract_json: *const c_char) -> *mut c_void {
+    let result = (|| -> Result<JsonContractLoader, Box<dyn std::error::Error>> {
+        let contract_str = CStr::from_ptr(contract_json).to_str()?;
+        Ok(JsonContractLoader::from_str(contract_str)?)
+    })();
+
+    match result {
+        Ok(loader) => Box::into_raw(Box::new(loader)) as *mut c_void,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a `JsonContractLoader` allocated by [`hrest_loader_new`].
+#[no_mangle]
+pub unsafe extern "C" fn hrest_loader_free(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr as *mut JsonContractLoader));
+    }
+}
+
+/// Stateful Encode: Encode a JSON payload to a binary HRest TLV buffer.
+///
+/// # Returns
+/// Pointer to a heap-allocated byte buffer on success, or `NULL` on error.
+/// Must be freed with [`hrest_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn hrest_loader_encode(
+    loader_ptr: *mut c_void,
+    route: *const c_char,
+    json: *const c_char,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if !out_len.is_null() {
+        *out_len = 0;
+    }
+
+    if loader_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let loader = &*(loader_ptr as *const JsonContractLoader);
+    
+    let result = (|| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let route_str = CStr::from_ptr(route).to_str()?;
+        let json_str = CStr::from_ptr(json).to_str()?;
+        let bytes = encode(route_str, json_str, loader)?;
+        Ok(bytes)
+    })();
+
+    match result {
+        Ok(bytes) => {
+            let len = bytes.len();
+            let mut boxed = bytes.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            if !out_len.is_null() {
+                *out_len = len;
+            }
+            ptr
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Stateful Decode: Decode a binary HRest TLV buffer to a JSON string.
+///
+/// # Returns
+/// Pointer to a null-terminated, heap-allocated UTF-8 string on success,
+/// or `NULL` on error. Must be freed with [`hrest_free_str`].
+#[no_mangle]
+pub unsafe extern "C" fn hrest_loader_decode(
+    loader_ptr: *mut c_void,
+    route: *const c_char,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> *mut c_char {
+    if loader_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let loader = &*(loader_ptr as *const JsonContractLoader);
+
+    let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+        let route_str = CStr::from_ptr(route).to_str()?;
+        let byte_slice = std::slice::from_raw_parts(bytes, bytes_len);
+        let json = decode(route_str, byte_slice, loader)?;
+        Ok(json)
+    })();
+
+    match result {
+        Ok(json) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(std::ptr::null_mut()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Stateful Verify Hash: Verify that a client-provided hash matches the contract's stored hash.
+#[no_mangle]
+pub unsafe extern "C" fn hrest_loader_verify_hash(
+    loader_ptr: *mut c_void,
+    client_hash: *const c_char,
+) -> i32 {
+    if loader_ptr.is_null() {
+        return 0;
+    }
+    
+    let loader = &*(loader_ptr as *const JsonContractLoader);
+    
+    let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+        let hash_str = CStr::from_ptr(client_hash).to_str()?;
+        Ok(loader.verify_hash(hash_str))
+    })();
+
+    match result {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stateless FFI (Legacy/Slow)
 // ---------------------------------------------------------------------------
 
 /// Encode a JSON payload to a binary HRest TLV buffer.
