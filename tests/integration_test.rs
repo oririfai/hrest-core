@@ -128,16 +128,21 @@ fn round_trip_bool_false() {
 
 #[test]
 fn round_trip_float() {
+    // Wire format v2 uses f32 encoding (4 bytes). f32 has ~7 significant digits.
+    // 98.6_f64 as f32 = 98.5999984741211, so tolerance must be >= ~2e-7.
     let result = round_trip(r#"{"score": 98.6}"#);
     let f = result["score"].as_f64().expect("Should be a float");
-    assert!((f - 98.6).abs() < 1e-9, "Float value should be preserved: {}", f);
+    let expected = 98.6_f64 as f32 as f64; // what f32 encoding actually produces
+    assert!((f - expected).abs() < 1e-9, "Float value should round-trip through f32: {}", f);
 }
 
 #[test]
 fn round_trip_float_negative() {
+    // Wire format v2 uses f32; compare against f32 round-trip value.
     let result = round_trip(r#"{"score": -273.15}"#);
     let f = result["score"].as_f64().unwrap();
-    assert!((f - (-273.15)).abs() < 1e-9);
+    let expected = (-273.15_f64) as f32 as f64;
+    assert!((f - expected).abs() < 1e-9);
 }
 
 #[test]
@@ -394,7 +399,7 @@ fn non_object_payload_is_rejected() {
 #[test]
 fn deeply_nested_binary_exceeding_limit_is_rejected() {
     // Craft a binary with 34 levels of nesting (MAX = 32).
-    // Each iteration: [field_id=3(config), TYPE_NESTED=0x05, OBJECT=0x00, count_lo=1, count_hi=0]
+    // Wire format v2: [field_id, TYPE_NESTED=0x05, OBJECT=0x00, count:u8]
     let loader = make_loader();
     let mut binary: Vec<u8> = Vec::new();
 
@@ -403,8 +408,7 @@ fn deeply_nested_binary_exceeding_limit_is_rejected() {
         binary.push(3);    // field_id = config
         binary.push(0x05); // TYPE_NESTED
         binary.push(0x00); // NESTED_KIND_OBJECT
-        binary.push(1);    // count lo-byte = 1
-        binary.push(0);    // count hi-byte = 0
+        binary.push(1);    // compact count = 1 (v2: single u8)
     }
     // Innermost leaf: config = null
     binary.push(3);        // field_id = config
@@ -420,6 +424,7 @@ fn deeply_nested_binary_exceeding_limit_is_rejected() {
 #[test]
 fn nesting_at_exact_max_depth_is_accepted() {
     // 32 levels of nesting should succeed (MAX = 32).
+    // Wire format v2: compact count uses 1 byte for count < 255.
     let loader = make_loader();
     let mut binary: Vec<u8> = Vec::new();
 
@@ -427,7 +432,7 @@ fn nesting_at_exact_max_depth_is_accepted() {
         binary.push(3);    // config
         binary.push(0x05); // TYPE_NESTED
         binary.push(0x00); // OBJECT
-        binary.push(1); binary.push(0); // count = 1
+        binary.push(1);    // compact count = 1 (v2: single u8)
     }
     // Leaf: config = null
     binary.push(3);
@@ -531,11 +536,12 @@ fn completely_random_bytes_do_not_panic() {
 fn unknown_token_mid_stream_is_rejected() {
     let loader = make_loader();
     // Valid first field: event (id=1) = string "ok"
-    // Then illegal token 0xFE mid-stream
+    // Wire format v2: string length is compact u8 (single byte for len < 255)
+    // Then illegal field_id 0xFE mid-stream
     let binary = &[
         0x01u8,             // field_id = event
         0x01,               // TYPE_STRING
-        0x02, 0x00,         // len = 2
+        0x02,               // compact len = 2 (v2: single u8, no high byte)
         b'o', b'k',         // "ok"
         0xFE,               // ILLEGAL field_id (not in contract)
         0x01,               // TYPE_STRING (doesn't matter)
@@ -612,26 +618,33 @@ fn i64_max_round_trips() {
 
 #[test]
 fn float_precision_is_preserved() {
+    // Wire format v2 uses f32 encoding (~7 significant digits).
+    // PI as f32 = 3.1415927410125732 (vs f64 PI = 3.141592653589793).
+    // The round-trip value must match the f32 representation exactly.
     let result = round_trip(r#"{"score": 3.141592653589793}"#);
     let f = result["score"].as_f64().unwrap();
-    assert!((f - std::f64::consts::PI).abs() < 1e-15,
-        "Float precision must be preserved: got {}", f);
+    let expected = std::f64::consts::PI as f32 as f64; // exact f32 representation
+    assert!((f - expected).abs() < 1e-9,
+        "Float must round-trip through f32 precision: got {}, expected {}", f, expected);
 }
 
 #[test]
 fn float_subnormal_round_trips() {
-    // Subnormal (denormalized) floats should round-trip correctly
+    // Wire format v2 uses f32 encoding.
+    // Test that f32 subnormal values round-trip with exact bit equality.
+    // Note: f64 subnormals (e.g. 5e-324) underflow to 0.0 in f32; that is expected.
     let loader = make_loader();
-    let subnormal = 5e-324_f64; // smallest positive subnormal f64
-    let payload = format!(r#"{{"score": {}}}"#, subnormal);
+    let subnormal_f32 = 1.4e-45_f32; // smallest positive f32 subnormal
+    let subnormal_f64 = subnormal_f32 as f64;
+    let payload = format!(r#"{{"score": {}}}"#, subnormal_f64);
     let binary = encode(ROUTE, &payload, &loader).unwrap();
     let restored_str = decode(ROUTE, &binary, &loader).unwrap();
     let restored: serde_json::Value = serde_json::from_str(&restored_str).unwrap();
     let f = restored["score"].as_f64().unwrap();
-    // Use exact bit comparison — subnormal floats must round-trip with zero loss.
-    // Note: 1e-330_f64 underflows to 0.0 in IEEE 754, so epsilon comparison is wrong here.
-    assert_eq!(f.to_bits(), subnormal.to_bits(),
-        "Subnormal float must round-trip with exact bit equality: got {}", f);
+    // Round-trip through f32: decoded value must match f32 encoding
+    let expected = (subnormal_f64 as f32) as f64;
+    assert!((f - expected).abs() < 1e-50,
+        "f32 subnormal must round-trip with f32 precision: got {}, expected {}", f, expected);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,52 +1,80 @@
 # HRest — Hyper-REST Binary Protocol
 
-> **High-Performance, REST-Compatible Binary Serialization Protocol**
+> **High-Performance, REST-Compatible Binary Protocol — Up to 53% Smaller Payload, 30% Less Bandwidth**
 
 [![Crates.io](https://img.shields.io/crates/v/hrest-core)](https://crates.io/crates/hrest-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-HRest is a high-performance data communication protocol that bridges the developer-friendliness of REST APIs (JSON on the developer side) with the transmission efficiency of binary protocols like gRPC — using **Key-Tokenization** and **Binary TLV Packing** over HTTP/2.
+HRest is a binary communication protocol that combines the developer-friendliness of REST/JSON with the transmission efficiency of binary protocols like gRPC — without requiring `.proto` file generation or code generation pipelines.
+
+Payloads are transmitted as compact binary (TLV) over standard HTTP. The middleware intercepts transparently: route handlers write and read normal JSON, while clients and servers communicate over the wire in binary. **Bandwidth consumption drops by 28–31% compared to standard REST**, with payload size reduced by 53%.
 
 ---
 
 ## Why HRest?
 
-| | REST (JSON) | gRPC (Protobuf) | **HRest** |
-|---|---|---|---|
-| **Wire format** | JSON text | Binary protobuf | **Binary TLV** |
-| **Dev experience** | ✅ Easy | ❌ Requires .proto generation | **✅ Uses your existing schemas** |
-| **Payload size** | Large | Small | **70–90% smaller than JSON** |
-| **HTTP version** | HTTP/1.1 | HTTP/2 (required) | **HTTP/2 + HTTP/3** |
-| **Browser support** | ✅ Native | ❌ Requires grpc-web | **✅ Via WASM** |
-| **Field whitelist** | ❌ None | ✅ .proto schema | **✅ Contract hash** |
+|                   | REST (JSON)               | gRPC (Protobuf)                     | HRest                                     |
+|-------------------|---------------------------|--------------------------------------|-------------------------------------------|
+| Wire format       | JSON text                 | Binary protobuf                      | Binary TLV                                |
+| Dev experience    | Easy                      | Requires .proto + codegen            | Uses your existing schemas                |
+| Payload size      | Baseline                  | Small                                | **53% smaller than JSON** (measured)      |
+| Bandwidth usage   | Baseline                  | Lower                                | **28–31% lower than JSON** (measured)     |
+| HTTP version      | HTTP/1.1                  | HTTP/2 (required)                    | HTTP/1.1, HTTP/2, HTTP/3                  |
+| Browser support   | Native                    | Requires grpc-web proxy              | Via WASM                                  |
+| Field whitelist   | None                      | .proto schema                        | Contract hash per route                   |
+| Schema migration  | Manual                    | Regenerate .proto                    | Regenerate contract file                  |
+
+---
+
+## Bandwidth Reduction — Measured Results
+
+The following numbers are from a real-world concurrent benchmark (100 concurrent users, 10,000 requests each):
+
+```
+Environment:  Apple M-series, macOS, uvicorn + uvloop + httptools
+Framework:    FastAPI + Pydantic v2, 1 worker
+Tool:         Apache Benchmark (ab -k -c 100 -n 10000)
+Payload:      Realistic nested JSON — user profile with devices, location, metadata
+```
+
+| Metric         | Standard JSON | HRest Binary | Delta              |
+|----------------|---------------|--------------|--------------------|
+| Payload size   | 574 bytes     | 268 bytes    | **-53.3%**         |
+| Bandwidth used | 2,237 KB/s    | 1,570 KB/s   | **-29.8%**         |
+| Throughput     | 9,625 req/s   | 8,690 req/s  | -9.7% (acceptable) |
+| Errors         | 0             | 0            | —                  |
+
+**Bandwidth is reduced proportionally to payload size.** Because each HRest response is 53% smaller, clients using HRest consume roughly 30% less download bandwidth for the same number of requests.
+
+The throughput gap (9.7%) is the unavoidable cost of encode/decode middleware — Rust-side processing takes ~7 microseconds per request; the remaining overhead is ASGI Python machinery.
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────┐
-│  Backend Developer (FastAPI / Express / etc.)  │
-│  Pydantic Model / Zod Schema / DTO             │
-│                    │                           │
-│         hrest-py / hrest-express               │  ← Middleware (coming soon)
-│         reads schema, auto-assigns field IDs   │
-└────────────────────┬───────────────────────────┘
-                     │ calls
-                     ▼
-┌────────────────────────────────────────────────┐
-│              hrest-core  (Rust)                │  ← This repository
-│                                                │
-│   encode(route, json, &contract) → Vec<u8>     │
-│   decode(route, bytes, &contract) → String     │
-│   verify_hash(contract, client_hash) → bool    │
-└────────────────────┬───────────────────────────┘
-                     │
-          ┌──────────┴──────────┐
-          ▼                     ▼
-    C FFI (.so/.dll)      WASM (.wasm)
-    hrest-py (cffi)       hrest-js (npm)
-    hrest-go (cgo)        Browser SDK
++------------------------------------------------+
+|  Backend Developer (FastAPI / Express / etc.)  |
+|  Pydantic Model / Zod Schema / DTO             |
+|                   |                            |
+|        hrest-py / hrest-express                |  <- Middleware
+|        reads schema, auto-assigns field IDs    |
++-------------------+----------------------------+
+                    | calls
+                    v
++------------------------------------------------+
+|             hrest-core  (Rust)                 |  <- This repository
+|                                                |
+|  encode(route, json, &contract) -> Vec<u8>     |
+|  decode(route, bytes, &contract) -> String     |
+|  verify_hash(contract, client_hash) -> bool    |
++-------------------+----------------------------+
+                    |
+         +----------+----------+
+         v                     v
+   C FFI (.so/.dll)      WASM (.wasm)
+   hrest-py (PyO3)       hrest-js (npm)
+   hrest-go (cgo)        Browser SDK
 ```
 
 ---
@@ -56,20 +84,30 @@ HRest is a high-performance data communication protocol that bridges the develop
 Every field is packed using a compact **TLV (Type-Length-Value)** structure:
 
 ```
-┌──────────────┬──────────────┬─────────────────────────┐
-│ FieldID (1B) │ DataType (1B)│ Value (N bytes)          │
-└──────────────┴──────────────┴─────────────────────────┘
++--------------+--------------+-------------------------+
+| FieldID (1B) | DataType (1B)| Value (N bytes)         |
++--------------+--------------+-------------------------+
 ```
 
-| Type Byte | Type    | Encoding                                        |
-|-----------|---------|-------------------------------------------------|
-| `0x00`    | Null    | *(no value bytes)*                              |
-| `0x01`    | String  | `[u16-LE length][UTF-8 bytes]`                  |
-| `0x02`    | Integer | Zigzag varint (efficient for negative numbers)  |
-| `0x03`    | Boolean | `0x00` = false, `0x01` = true                   |
-| `0x04`    | Bytes   | `[u16-LE length][raw bytes]`                    |
-| `0x05`    | Nested  | `[kind][u16-LE count][...]` recursive           |
-| `0x06`    | Float   | IEEE 754 f64, 8 bytes little-endian             |
+### Type Table (Wire Format v2)
+
+| Type Byte | Type    | Encoding                                                 |
+|-----------|---------|----------------------------------------------------------|
+| `0x00`    | Null    | *(no value bytes)*                                       |
+| `0x01`    | String  | `[u8 length*][UTF-8 bytes]`                              |
+| `0x02`    | Integer | Zigzag varint — efficient for small and negative numbers |
+| `0x03`    | Boolean | `0x00` = false, `0x01` = true                            |
+| `0x04`    | Bytes   | `[u8 length*][raw bytes]`                                |
+| `0x05`    | Nested  | `[kind][u8 count*][...]` — recursive object or array     |
+| `0x06`    | Float64 | IEEE 754 f64, 8 bytes little-endian                      |
+| `0x07`    | Float32 | IEEE 754 f32, 4 bytes little-endian                      |
+
+> `*` Compact encoding: values `< 255` use 1 byte; values `>= 255` use sentinel `0xFF` + 2-byte u16-LE.
+> In practice, nearly all strings, arrays, and objects are under 255 elements, so the overhead is always 1 byte.
+
+### Why Float32?
+
+For most application data (GPS coordinates, percentages, scores, battery levels), f32 provides approximately 7 significant digits of precision — more than sufficient. Using f32 instead of f64 saves **4 bytes per float field**. If full double precision is required (e.g. financial amounts), use integer encoding in cents or pass raw f64 bytes via the `Bytes` type.
 
 ---
 
@@ -101,7 +139,7 @@ fn main() {
     let contract_json = std::fs::read_to_string("hrest-contract.json").unwrap();
     let loader = JsonContractLoader::from_str(&contract_json).unwrap();
 
-    // 2. Encode: JSON → binary (send to client)
+    // 2. Encode: JSON -> binary (send to client)
     let payload = r#"{"event": "start", "task_id": 42, "headless": true}"#;
     let binary = encode("POST /api/v1/test/run", payload, &loader).unwrap();
 
@@ -111,7 +149,7 @@ fn main() {
         (1.0 - binary.len() as f64 / payload.len() as f64) * 100.0
     );
 
-    // 3. Decode: binary → JSON (receive from client)
+    // 3. Decode: binary -> JSON (receive from client)
     let restored = decode("POST /api/v1/test/run", &binary, &loader).unwrap();
     println!("Restored: {}", restored);
 }
@@ -148,8 +186,7 @@ HRest uses `hrest-contract.json` as the **single source of truth** between backe
 }
 ```
 
-> **Note:** Field IDs are auto-assigned alphabetically by the middleware.
-> Developers **never write these numbers manually**.
+> Field IDs are auto-assigned alphabetically by the middleware. Developers never write these numbers manually.
 
 ### Hash Validation
 
@@ -168,21 +205,21 @@ let hash = JsonContractLoader::compute_hash(&contract_json).unwrap();
 
 ## Security Model
 
-| Threat | Protection |
-|---|---|
-| **Field injection** | Per-route field whitelist — unknown field → HTTP 422 |
-| **Token injection** | Token ID whitelist — unknown byte → HTTP 422 |
-| **Buffer overflow** | `ByteCursor` bounds-checked — every read validated before access |
-| **Stack overflow** | Max nesting depth = 32 — deeply nested binary → rejected |
-| **Memory exhaustion** | Soft pre-alloc cap of 256 — crafted count field cannot OOM |
-| **NaN / Infinity float** | Rejected — not representable in JSON |
-| **Contract drift** | SHA-256 hash header — mismatch → HTTP 412 |
-| **Non-deterministic hash** | `BTreeMap` sorted keys — stable hash across all runs |
-| **Duplicate field IDs** | Detected at contract load time — invalid contract rejected |
+| Threat                  | Protection                                                              |
+|-------------------------|-------------------------------------------------------------------------|
+| Field injection         | Per-route field whitelist — unknown field ID returns HTTP 422           |
+| Token injection         | Type byte whitelist — unknown byte returns HTTP 422                     |
+| Buffer overflow         | `ByteCursor` bounds-checked — every read validated before access        |
+| Stack overflow          | Max nesting depth = 32 — deeply nested binary is rejected               |
+| Memory exhaustion       | Soft pre-alloc cap of 256 — crafted count field cannot OOM              |
+| NaN / Infinity float    | Rejected — not representable in JSON                                    |
+| Contract drift          | SHA-256 hash header — mismatch returns HTTP 412                         |
+| Non-deterministic hash  | `BTreeMap` sorted keys — stable hash across all runs and platforms      |
+| Duplicate field IDs     | Detected at contract load time — invalid contract is rejected           |
 
 ---
 
-## FFI — Python Integration (cffi / ctypes)
+## FFI — Python Integration (PyO3)
 
 ```bash
 # Build shared library
@@ -195,21 +232,17 @@ cargo build --release --features ffi
 ```
 
 ```python
-# Python — via ctypes (preview: hrest-py coming soon)
-import ctypes, json
+# Python — via hrest-py (PyO3 binding)
+from hrest._core import HrestLoader
 
-lib = ctypes.CDLL("./libhrest_core.dylib")
+# Parse contract once at startup — not per request
+loader = HrestLoader(open("hrest-contract.json").read())
 
-contract = open("hrest-contract.json").read().encode()
-payload  = json.dumps({"event": "start", "task_id": 42}).encode()
-route    = b"POST /api/v1/test/run"
+# Decode incoming binary request body
+json_str = loader.decode("POST /api/v1/test/run", request.body)
 
-out_len = ctypes.c_size_t(0)
-ptr = lib.hrest_encode(route, payload, contract, ctypes.byref(out_len))
-binary = bytes(ctypes.string_at(ptr, out_len.value))
-
-lib.hrest_free_bytes(ptr, out_len)
-print(f"Encoded {len(payload)} bytes → {len(binary)} bytes binary")
+# Encode outgoing JSON response to binary
+binary = loader.encode("POST /api/v1/test/run", json_str)
 ```
 
 ---
@@ -255,25 +288,23 @@ const result = JSON.parse(decode("POST /api/v1/test/run", resultBinary, contract
 
 ## HTTP Headers
 
-HRest uses the following HTTP headers alongside binary payloads:
+| Header                        | Direction          | Description                             |
+|-------------------------------|--------------------|-----------------------------------------|
+| `Content-Type: application/hrest` | Request + Response | Signals binary HRest payload        |
+| `X-Hrest-Hash: <sha256>`      | Request            | Client contract version validation      |
+| `X-Hrest-Version: 1.0.0`     | Request            | Protocol version check                  |
+| `X-Hrest-Error: <CODE>`       | Response           | Machine-readable error code             |
 
-| Header | Direction | Description |
-|---|---|---|
-| `Content-Type: application/hrest` | Request + Response | Signals binary HRest payload |
-| `X-Hrest-Hash: <sha256>` | Request | Client contract version validation |
-| `X-Hrest-Version: 1.0.0` | Request | Protocol version check |
-| `X-Hrest-Error: <CODE>` | Response | Machine-readable error code |
+**Error code — HTTP status mapping:**
 
-**Error code → HTTP status mapping:**
-
-| `HrestError` | HTTP Status | `X-Hrest-Error` Header |
-|---|---|---|
-| `UnknownRoute` | 400 | `UNKNOWN_ROUTE` |
-| `UnknownField` | 422 | `UNKNOWN_FIELD` |
-| `UnknownToken` | 422 | `UNKNOWN_TOKEN` |
-| `BufferOverflow` | 400 | `BUFFER_OVERFLOW` |
-| `MalformedPayload` | 400 | `MALFORMED_PAYLOAD` |
-| Hash mismatch | 412 | `HASH_MISMATCH` |
+| `HrestError`        | HTTP Status | `X-Hrest-Error` Header |
+|---------------------|-------------|------------------------|
+| `UnknownRoute`      | 400         | `UNKNOWN_ROUTE`        |
+| `UnknownField`      | 422         | `UNKNOWN_FIELD`        |
+| `UnknownToken`      | 422         | `UNKNOWN_TOKEN`        |
+| `BufferOverflow`    | 400         | `BUFFER_OVERFLOW`      |
+| `MalformedPayload`  | 400         | `MALFORMED_PAYLOAD`    |
+| Hash mismatch       | 412         | `HASH_MISMATCH`        |
 
 > Header processing is handled by middleware (hrest-py, hrest-express, etc.), not by `hrest-core` directly.
 
@@ -282,7 +313,7 @@ HRest uses the following HTTP headers alongside binary payloads:
 ## Test Suite
 
 ```bash
-# Run all tests (80 tests, 0 failures)
+# Run all tests (58 integration + 18 unit + 4 doc = 80 total)
 cargo test
 
 # Unit tests only
@@ -300,15 +331,15 @@ cargo test -- --nocapture
 running 18 tests (unit)        ... ok
 running 58 tests (integration) ... ok
 running  4 tests (doc)         ... ok
-────────────────────────────────────
-total: 80 passed, 0 failed ✅
+------------------------------------
+total: 80 passed, 0 failed
 ```
 
 **Test categories:**
-- **Round-trip**: all 7 types (null, string, int, bool, bytes, nested, float)
-- **Security [SEC]**: depth attack, NaN/Infinity, memory exhaustion, token injection, fuzz
-- **Reliability [REL]**: Unicode, i64 boundaries, float precision, subnormal floats
-- **Durability [DUR]**: hash determinism, duplicate IDs, wire format stability
+- Round-trip: all 8 types (null, string, int, bool, bytes, nested, float64, float32)
+- Security [SEC]: depth attack, NaN/Infinity, memory exhaustion, token injection, fuzz
+- Reliability [REL]: Unicode, i64 boundaries, float precision, subnormal floats
+- Durability [DUR]: hash determinism, duplicate IDs, wire format stability
 
 ---
 
@@ -317,6 +348,7 @@ total: 80 passed, 0 failed ✅
 - [x] `hrest-core` — Rust binary engine (encode / decode / verify)
 - [x] C FFI exports (`libhrest_core.so`)
 - [x] WASM exports (`hrest_core.wasm`)
+- [x] Wire format v2 — compact u8 lengths, f32 float support
 - [ ] `hrest-py` — Python middleware (FastAPI + Pydantic auto-schema)
 - [ ] `hrest-express` — Node.js middleware (Express + Zod)
 - [ ] `hrest-fastify` — Fastify plugin
@@ -330,26 +362,26 @@ total: 80 passed, 0 failed ✅
 
 ```
 hyperrest/
-├── hrest-core/                ← Rust core engine (this repository)
-│   ├── src/
-│   │   ├── lib.rs             Public API: encode(), decode()
-│   │   ├── domain/            Pure Rust, zero external deps
-│   │   │   ├── error.rs       HrestError enum
-│   │   │   ├── data_type.rs   DataType enum + TYPE_* constants
-│   │   │   └── contract.rs    ContractData + FieldMap
-│   │   ├── application/       Use cases (Clean Architecture)
-│   │   │   ├── ports.rs       Traits: ContractProvider, Encode, Decode
-│   │   │   ├── encoder.rs     JSON → binary TLV
-│   │   │   └── decoder.rs     binary TLV → JSON (depth-limited)
-│   │   ├── infrastructure/    External adapters
-│   │   │   ├── contract_loader.rs  JsonContractLoader (serde_json, sha2)
-│   │   │   └── varint.rs           Zigzag varint encode/decode
-│   │   ├── ffi/               C exports (feature = "ffi")
-│   │   └── wasm/              WASM exports (feature = "wasm")
-│   └── tests/
-│       └── integration_test.rs
-├── .gitignore
-└── LICENSE
++-- hrest-core/                <- Rust core engine (this repository)
+|   +-- src/
+|   |   +-- lib.rs             Public API: encode(), decode()
+|   |   +-- domain/            Pure Rust, zero external deps
+|   |   |   +-- error.rs       HrestError enum
+|   |   |   +-- data_type.rs   DataType enum + TYPE_* constants (v2)
+|   |   |   +-- contract.rs    ContractData + FieldMap
+|   |   +-- application/       Use cases (Clean Architecture)
+|   |   |   +-- ports.rs       Traits: ContractProvider, Encode, Decode
+|   |   |   +-- encoder.rs     JSON -> binary TLV (v2)
+|   |   |   +-- decoder.rs     binary TLV -> JSON, depth-limited (v2)
+|   |   +-- infrastructure/    External adapters
+|   |   |   +-- contract_loader.rs  JsonContractLoader (serde_json, sha2)
+|   |   |   +-- varint.rs           Zigzag varint encode/decode
+|   |   +-- ffi/               C exports (feature = "ffi")
+|   |   +-- wasm/              WASM exports (feature = "wasm")
+|   +-- tests/
+|       +-- integration_test.rs
++-- .gitignore
++-- LICENSE
 ```
 
 ---

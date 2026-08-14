@@ -16,7 +16,52 @@ use crate::infrastructure::contract_loader::JsonContractLoader;
 use crate::{decode, encode};
 
 // ---------------------------------------------------------------------------
-// Core encode / decode
+// Stateful HrestLoader (Recommended)
+// ---------------------------------------------------------------------------
+
+/// A pre-loaded HRest contract. Instantiate once at app startup, reuse
+/// across all requests. This is the recommended API for production use.
+#[wasm_bindgen]
+pub struct HrestLoader {
+    inner: JsonContractLoader,
+}
+
+#[wasm_bindgen]
+impl HrestLoader {
+    /// Create a new loader by parsing the contract JSON string once.
+    /// Call this at startup, not per-request.
+    #[wasm_bindgen(constructor)]
+    pub fn new(contract_json: &str) -> Result<HrestLoader, JsValue> {
+        let loader = JsonContractLoader::from_str(contract_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(Self { inner: loader })
+    }
+
+    /// Encode a JSON payload string into a binary HRest TLV `Uint8Array`.
+    pub fn encode(&self, route: &str, json: &str) -> Result<Vec<u8>, JsValue> {
+        encode(route, json, &self.inner).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Decode a binary HRest TLV `Uint8Array` back to a JSON string.
+    pub fn decode(&self, route: &str, bytes: &[u8]) -> Result<String, JsValue> {
+        decode(route, bytes, &self.inner).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Verify that a client-provided hash matches the loaded contract's hash.
+    #[wasm_bindgen(js_name = verifyHash)]
+    pub fn verify_hash(&self, client_hash: &str) -> bool {
+        self.inner.verify_hash(client_hash)
+    }
+
+    /// Return the stored contract hash string.
+    #[wasm_bindgen(js_name = contractHash)]
+    pub fn contract_hash(&self) -> String {
+        self.inner.contract_hash().to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stateless Core encode / decode (Deprecated)
 // ---------------------------------------------------------------------------
 
 /// Encode a JSON payload string into a binary HRest TLV `Uint8Array`.

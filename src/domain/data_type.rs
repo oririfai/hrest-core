@@ -2,8 +2,11 @@
 // DOMAIN LAYER — data_type.rs
 //
 // Wire format type constants and the DataType enum.
-// These constants define the HRest Binary Protocol v1 wire format.
-// DO NOT change byte values without updating the protocol version.
+//
+// Protocol versions:
+//   v1: strings use u16-LE length; containers use u16-LE count; floats are f64
+//   v2: strings use u8 length (0xFF sentinel for ≥255); containers use u8 count;
+//       floats may be f32 (TYPE_FLOAT32 = 0x07)
 //
 // SOLID-O: Open for extension (add new variants), closed for modification.
 // ============================================================================
@@ -36,9 +39,18 @@ pub const TYPE_NESTED: u8 = 0x05;
 /// 64-bit IEEE 754 float. Encoded as 8 bytes little-endian.
 pub const TYPE_FLOAT: u8 = 0x06;
 
+/// 32-bit IEEE 754 float (wire format v2). Encoded as 4 bytes little-endian.
+/// Saves 4 bytes per float field vs TYPE_FLOAT. Use when 7 significant digits
+/// of precision are sufficient (e.g. GPS coordinates, battery level, scores).
+pub const TYPE_FLOAT32: u8 = 0x07;
+
 // Nested kind discriminants
 pub const NESTED_KIND_OBJECT: u8 = 0x00;
 pub const NESTED_KIND_ARRAY: u8 = 0x01;
+
+// Length / count sentinel for wire format v2 compact encoding:
+// if the length/count byte equals this sentinel, the next 2 bytes hold the u16 value.
+pub const COMPACT_SENTINEL: u8 = 0xFF;
 
 // ---------------------------------------------------------------------------
 // DataType enum
@@ -59,8 +71,10 @@ pub enum DataType {
     Bytes,
     /// `0x05` — Nested object or array.
     Nested,
-    /// `0x06` — 64-bit IEEE 754 float.
+    /// `0x06` — 64-bit IEEE 754 float (f64, 8 bytes).
     Float,
+    /// `0x07` — 32-bit IEEE 754 float (f32, 4 bytes). Wire format v2.
+    Float32,
 }
 
 impl TryFrom<u8> for DataType {
@@ -79,6 +93,7 @@ impl TryFrom<u8> for DataType {
             TYPE_BYTES   => Ok(DataType::Bytes),
             TYPE_NESTED  => Ok(DataType::Nested),
             TYPE_FLOAT   => Ok(DataType::Float),
+            TYPE_FLOAT32 => Ok(DataType::Float32),
             other        => Err(HrestError::InvalidDataType(other)),
         }
     }
@@ -87,13 +102,14 @@ impl TryFrom<u8> for DataType {
 impl From<DataType> for u8 {
     fn from(dt: DataType) -> u8 {
         match dt {
-            DataType::Null   => TYPE_NULL,
-            DataType::Str    => TYPE_STRING,
-            DataType::Int    => TYPE_INT,
-            DataType::Bool   => TYPE_BOOL,
-            DataType::Bytes  => TYPE_BYTES,
-            DataType::Nested => TYPE_NESTED,
-            DataType::Float  => TYPE_FLOAT,
+            DataType::Null    => TYPE_NULL,
+            DataType::Str     => TYPE_STRING,
+            DataType::Int     => TYPE_INT,
+            DataType::Bool    => TYPE_BOOL,
+            DataType::Bytes   => TYPE_BYTES,
+            DataType::Nested  => TYPE_NESTED,
+            DataType::Float   => TYPE_FLOAT,
+            DataType::Float32 => TYPE_FLOAT32,
         }
     }
 }
@@ -101,13 +117,14 @@ impl From<DataType> for u8 {
 impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            DataType::Null   => "Null",
-            DataType::Str    => "String",
-            DataType::Int    => "Int",
-            DataType::Bool   => "Bool",
-            DataType::Bytes  => "Bytes",
-            DataType::Nested => "Nested",
-            DataType::Float  => "Float",
+            DataType::Null    => "Null",
+            DataType::Str     => "String",
+            DataType::Int     => "Int",
+            DataType::Bool    => "Bool",
+            DataType::Bytes   => "Bytes",
+            DataType::Nested  => "Nested",
+            DataType::Float   => "Float64",
+            DataType::Float32 => "Float32",
         };
         write!(f, "{}", name)
     }
@@ -123,13 +140,14 @@ mod tests {
     #[test]
     fn round_trip_all_types() {
         let types = [
-            (TYPE_NULL,   DataType::Null),
-            (TYPE_STRING, DataType::Str),
-            (TYPE_INT,    DataType::Int),
-            (TYPE_BOOL,   DataType::Bool),
-            (TYPE_BYTES,  DataType::Bytes),
-            (TYPE_NESTED, DataType::Nested),
-            (TYPE_FLOAT,  DataType::Float),
+            (TYPE_NULL,    DataType::Null),
+            (TYPE_STRING,  DataType::Str),
+            (TYPE_INT,     DataType::Int),
+            (TYPE_BOOL,    DataType::Bool),
+            (TYPE_BYTES,   DataType::Bytes),
+            (TYPE_NESTED,  DataType::Nested),
+            (TYPE_FLOAT,   DataType::Float),
+            (TYPE_FLOAT32, DataType::Float32),
         ];
 
         for (byte, expected) in types {

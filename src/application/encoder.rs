@@ -26,7 +26,8 @@ use serde_json::Value as Json;
 use crate::application::ports::ContractProvider;
 use crate::domain::contract::FieldMap;
 use crate::domain::data_type::{
-    NESTED_KIND_ARRAY, NESTED_KIND_OBJECT, TYPE_BOOL, TYPE_BYTES, TYPE_FLOAT, TYPE_INT,
+    COMPACT_SENTINEL, NESTED_KIND_ARRAY, NESTED_KIND_OBJECT,
+    TYPE_BOOL, TYPE_BYTES, TYPE_FLOAT32, TYPE_INT,
     TYPE_NESTED, TYPE_NULL, TYPE_STRING,
 };
 use crate::domain::error::HrestError;
@@ -109,31 +110,40 @@ fn encode_null(out: &mut Vec<u8>) {
     out.push(TYPE_NULL);
 }
 
-/// `0x01 [u16-LE len] [utf8 bytes]`
+/// `0x01 [u8 len][utf8 bytes]`  — wire format v2 compact encoding.
+///
+/// For strings shorter than 255 bytes (virtually all real-world strings),
+/// the length fits in one byte, saving 1 byte vs the v1 u16-LE encoding.
+/// Strings of 255+ bytes use `0xFF` sentinel + u16-LE (3 bytes total).
 fn encode_string(out: &mut Vec<u8>, s: &str) -> Result<(), HrestError> {
     let bytes = s.as_bytes();
-    let len = u16::try_from(bytes.len()).map_err(|_| {
-        HrestError::MalformedPayload(format!(
+    if bytes.len() > 65535 {
+        return Err(HrestError::MalformedPayload(format!(
             "String too long: {} bytes (max 65535)",
             bytes.len()
-        ))
-    })?;
+        )));
+    }
     out.push(TYPE_STRING);
-    out.extend_from_slice(&len.to_le_bytes());
+    write_compact_len(out, bytes.len());
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-/// `0x02 [zigzag varint]` for integers, or `0x06 [f64 LE]` for floats.
+/// `0x02 [zigzag varint]` for integers, or `0x07 [f32 LE]` for floats.
+///
+/// Wire format v2 uses f32 (4 bytes) instead of f64 (8 bytes).
+/// This provides ~7 significant digits of precision — sufficient for
+/// GPS coordinates, battery percentages, scores, and most application data.
+/// Use TYPE_BYTES to pass raw f64 bits if full double precision is needed.
 fn encode_number(out: &mut Vec<u8>, n: &serde_json::Number) -> Result<(), HrestError> {
     if n.is_i64() {
         let i = n.as_i64().unwrap(); // safe: is_i64() confirmed
         out.push(TYPE_INT);
         out.extend_from_slice(&encode_varint(i));
     } else if n.is_f64() {
-        let f = n.as_f64().unwrap(); // safe: is_f64() confirmed
-        out.push(TYPE_FLOAT);
-        out.extend_from_slice(&f.to_le_bytes());
+        let f = n.as_f64().unwrap() as f32; // safe: is_f64() confirmed; cast to f32
+        out.push(TYPE_FLOAT32);
+        out.extend_from_slice(&f.to_le_bytes()); // 4 bytes instead of 8
     } else {
         // u64 > i64::MAX — cannot encode in current protocol
         return Err(HrestError::MalformedPayload(format!(
@@ -151,37 +161,36 @@ fn encode_bool(out: &mut Vec<u8>, b: bool) {
     out.push(b as u8);
 }
 
-/// `0x04 [u16-LE len] [raw bytes]`
-/// Reserved for programmatic use — e.g. encoding pre-computed UUID bytes.
+/// `0x04 [u8 len | 0xFF u16-LE len] [raw bytes]`
 #[allow(dead_code)]
 fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), HrestError> {
-    let len = u16::try_from(bytes.len()).map_err(|_| {
-        HrestError::MalformedPayload(format!(
+    if bytes.len() > 65535 {
+        return Err(HrestError::MalformedPayload(format!(
             "Bytes value too long: {} bytes (max 65535)",
             bytes.len()
-        ))
-    })?;
+        )));
+    }
     out.push(TYPE_BYTES);
-    out.extend_from_slice(&len.to_le_bytes());
+    write_compact_len(out, bytes.len());
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-/// `0x05 0x01 [u16-LE count] Value*`
+/// `0x05 0x01 [u8 count | 0xFF u16-LE] Value*`  — v2 compact count encoding.
 fn encode_array(
     out: &mut Vec<u8>,
     arr: &[Json],
     field_map: &FieldMap,
 ) -> Result<(), HrestError> {
-    let count = u16::try_from(arr.len()).map_err(|_| {
-        HrestError::MalformedPayload(format!(
+    if arr.len() > 65535 {
+        return Err(HrestError::MalformedPayload(format!(
             "Array too long: {} elements (max 65535)",
             arr.len()
-        ))
-    })?;
+        )));
+    }
     out.push(TYPE_NESTED);
     out.push(NESTED_KIND_ARRAY);
-    out.extend_from_slice(&count.to_le_bytes());
+    write_compact_count(out, arr.len());
 
     for elem in arr {
         encode_value(out, elem, field_map)?;
@@ -189,23 +198,51 @@ fn encode_array(
     Ok(())
 }
 
-/// `0x05 0x00 [u16-LE field_count] (FieldID Value)*`
+/// `0x05 0x00 [u8 count | 0xFF u16-LE] (FieldID Value)*`  — v2 compact count.
 fn encode_nested_object(
     out: &mut Vec<u8>,
     obj: &serde_json::Map<String, Json>,
     field_map: &FieldMap,
 ) -> Result<(), HrestError> {
-    let count = u16::try_from(obj.len()).map_err(|_| {
-        HrestError::MalformedPayload(format!(
+    if obj.len() > 65535 {
+        return Err(HrestError::MalformedPayload(format!(
             "Nested object has too many fields: {} (max 65535)",
             obj.len()
-        ))
-    })?;
+        )));
+    }
     out.push(TYPE_NESTED);
     out.push(NESTED_KIND_OBJECT);
-    out.extend_from_slice(&count.to_le_bytes());
+    write_compact_count(out, obj.len());
 
     encode_object_fields(out, obj, field_map)
+}
+
+// ---------------------------------------------------------------------------
+// Wire format v2 helpers — compact length/count encoding
+// ---------------------------------------------------------------------------
+
+/// Write a compact u8 length (1 byte for values < 255, or 0xFF + u16-LE for ≥ 255).
+/// Used for string / bytes lengths in wire format v2.
+#[inline]
+fn write_compact_len(out: &mut Vec<u8>, len: usize) {
+    if len < 255 {
+        out.push(len as u8);
+    } else {
+        out.push(COMPACT_SENTINEL);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    }
+}
+
+/// Write a compact u8 count (1 byte for values < 255, or 0xFF + u16-LE for ≥ 255).
+/// Used for object field counts and array element counts in wire format v2.
+#[inline]
+fn write_compact_count(out: &mut Vec<u8>, count: usize) {
+    if count < 255 {
+        out.push(count as u8);
+    } else {
+        out.push(COMPACT_SENTINEL);
+        out.extend_from_slice(&(count as u16).to_le_bytes());
+    }
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use serde_json::Value as Json;
 
 use crate::application::ports::ContractProvider;
 use crate::domain::contract::FieldMap;
-use crate::domain::data_type::{DataType, NESTED_KIND_ARRAY, NESTED_KIND_OBJECT};
+use crate::domain::data_type::{DataType, COMPACT_SENTINEL, NESTED_KIND_ARRAY, NESTED_KIND_OBJECT};
 use crate::domain::error::HrestError;
 use crate::infrastructure::varint::decode_varint;
 
@@ -120,6 +120,19 @@ impl<'a> ByteCursor<'a> {
         Ok(arr)
     }
 
+    /// Read exactly 4 bytes as a fixed-size array. Bounds-checked. No unwrap.
+    /// Used for f32 (TYPE_FLOAT32) in wire format v2.
+    fn read_bytes_4(&mut self) -> Result<[u8; 4], HrestError> {
+        self.ensure_available(4)?;
+        let arr: [u8; 4] = self.data[self.pos..self.pos + 4]
+            .try_into()
+            .map_err(|_| HrestError::MalformedPayload(
+                "Internal: failed to read 4-byte float slice".into()
+            ))?;
+        self.pos += 4;
+        Ok(arr)
+    }
+
     /// Return remaining bytes starting from current position (for varint).
     fn remaining_slice(&self) -> &[u8] {
         &self.data[self.pos..]
@@ -177,13 +190,14 @@ fn read_value(cursor: &mut ByteCursor, field_map: &FieldMap, depth: usize) -> Re
     let data_type = DataType::try_from(type_byte)?;
 
     match data_type {
-        DataType::Null   => read_null(),
-        DataType::Str    => read_string(cursor),
-        DataType::Int    => read_int(cursor),
-        DataType::Bool   => read_bool(cursor),
-        DataType::Bytes  => read_bytes(cursor),
-        DataType::Float  => read_float(cursor),
-        DataType::Nested => read_nested(cursor, field_map, depth + 1),
+        DataType::Null    => read_null(),
+        DataType::Str     => read_string(cursor),
+        DataType::Int     => read_int(cursor),
+        DataType::Bool    => read_bool(cursor),
+        DataType::Bytes   => read_bytes(cursor),
+        DataType::Float   => read_float(cursor),
+        DataType::Float32 => read_float32(cursor),
+        DataType::Nested  => read_nested(cursor, field_map, depth + 1),
     }
 }
 
@@ -193,9 +207,12 @@ fn read_null() -> Result<Json, HrestError> {
     Ok(Json::Null)
 }
 
-/// `0x01 [u16-LE len] [utf8 bytes]` → `Json::String`
+/// `0x01 [u8 len | 0xFF u16-LE] [utf8 bytes]`  — wire format v2 compact length.
+///
+/// If the length byte is 0xFF (COMPACT_SENTINEL), the following 2 bytes
+/// hold the actual u16-LE length. Otherwise the single byte is the length.
 fn read_string(cursor: &mut ByteCursor) -> Result<Json, HrestError> {
-    let len = cursor.read_u16_le()? as usize;
+    let len = read_compact_len(cursor)?;
     let bytes = cursor.read_bytes(len)?;
 
     let s = std::str::from_utf8(bytes).map_err(|e| {
@@ -218,11 +235,11 @@ fn read_bool(cursor: &mut ByteCursor) -> Result<Json, HrestError> {
     Ok(Json::Bool(byte != 0))
 }
 
-/// `0x04 [u16-LE len] [raw bytes]` → `Json::String` (hex-encoded)
+/// `0x04 [u8 len | 0xFF u16-LE] [raw bytes]`  — v2 compact length.
 ///
 /// Raw bytes are hex-encoded in JSON output to safely represent all bit patterns.
 fn read_bytes(cursor: &mut ByteCursor) -> Result<Json, HrestError> {
-    let len = cursor.read_u16_le()? as usize;
+    let len = read_compact_len(cursor)?;
     let bytes = cursor.read_bytes(len)?;
     Ok(Json::String(hex::encode(bytes)))
 }
@@ -239,7 +256,25 @@ fn read_float(cursor: &mut ByteCursor) -> Result<Json, HrestError> {
         .map(Json::Number)
         .ok_or_else(|| {
             HrestError::MalformedPayload(
-                "Float value is NaN or Infinity — not representable in JSON (security reject)"
+                "Float64 value is NaN or Infinity — not representable in JSON (security reject)"
+                    .into(),
+            )
+        })
+}
+
+/// `0x07 [f32 LE 4 bytes]` → `Json::Number`  — wire format v2.
+///
+/// Decoded as f32, then widened to f64 for JSON (all f32 values are valid f64).
+/// Security: NaN and Infinity are still rejected.
+fn read_float32(cursor: &mut ByteCursor) -> Result<Json, HrestError> {
+    let arr = cursor.read_bytes_4()?;
+    let f = f32::from_le_bytes(arr) as f64; // widen to f64 for JSON compatibility
+
+    serde_json::Number::from_f64(f)
+        .map(Json::Number)
+        .ok_or_else(|| {
+            HrestError::MalformedPayload(
+                "Float32 value is NaN or Infinity — not representable in JSON (security reject)"
                     .into(),
             )
         })
@@ -269,9 +304,9 @@ fn read_nested(cursor: &mut ByteCursor, field_map: &FieldMap, depth: usize) -> R
     }
 }
 
-/// `0x05 0x00 [u16-LE count] (FieldID Value)*` → `Json::Object`
+/// `0x05 0x00 [u8 count | 0xFF u16-LE] (FieldID Value)*` → `Json::Object`
 fn read_nested_object(cursor: &mut ByteCursor, field_map: &FieldMap, depth: usize) -> Result<Json, HrestError> {
-    let field_count = cursor.read_u16_le()? as usize;
+    let field_count = read_compact_count(cursor)?;
 
     // [2] Soft-cap pre-allocation to prevent memory exhaustion
     let capacity = field_count.min(MAX_PREALLOC_CAPACITY);
@@ -291,9 +326,9 @@ fn read_nested_object(cursor: &mut ByteCursor, field_map: &FieldMap, depth: usiz
     Ok(Json::Object(map))
 }
 
-/// `0x05 0x01 [u16-LE count] Value*` → `Json::Array`
+/// `0x05 0x01 [u8 count | 0xFF u16-LE] Value*` → `Json::Array`
 fn read_nested_array(cursor: &mut ByteCursor, field_map: &FieldMap, depth: usize) -> Result<Json, HrestError> {
-    let elem_count = cursor.read_u16_le()? as usize;
+    let elem_count = read_compact_count(cursor)?;
 
     // [2] Soft-cap pre-allocation to prevent memory exhaustion
     let capacity = elem_count.min(MAX_PREALLOC_CAPACITY);
@@ -304,4 +339,27 @@ fn read_nested_array(cursor: &mut ByteCursor, field_map: &FieldMap, depth: usize
     }
 
     Ok(Json::Array(arr))
+}
+
+// ---------------------------------------------------------------------------
+// Wire format v2 helpers — compact length/count decoding
+// ---------------------------------------------------------------------------
+
+/// Read a compact length (v2 format):
+/// - If next byte < 0xFF: that byte IS the length (1 byte total)
+/// - If next byte == 0xFF: read following 2 bytes as u16-LE length
+#[inline]
+fn read_compact_len(cursor: &mut ByteCursor) -> Result<usize, HrestError> {
+    let byte = cursor.read_u8()?;
+    if byte < COMPACT_SENTINEL {
+        Ok(byte as usize)
+    } else {
+        Ok(cursor.read_u16_le()? as usize)
+    }
+}
+
+/// Read a compact count (v2 format): same encoding as compact length.
+#[inline]
+fn read_compact_count(cursor: &mut ByteCursor) -> Result<usize, HrestError> {
+    read_compact_len(cursor)
 }
