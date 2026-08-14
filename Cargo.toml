@@ -1,6 +1,6 @@
 [package]
 name = "hrest-core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "HRest Protocol — High-Performance Binary Serialization Core Engine"
 license = "MIT"
@@ -10,9 +10,10 @@ categories = ["encoding", "network-programming", "web-programming"]
 
 [lib]
 name = "hrest_core"
-# cdylib  → C shared library (FFI: .so / .dll / .dylib)
-# rlib    → Rust library (used as a Rust dependency)
-crate-type = ["cdylib", "rlib"]
+# cdylib    → C shared library (FFI: .so / .dll / .dylib)
+# staticlib → C static library (FFI: .a / .lib) for Go CGO
+# rlib      → Rust library (used as a Rust dependency)
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 # ---------------------------------------------------------------------------
 # Feature Flags
